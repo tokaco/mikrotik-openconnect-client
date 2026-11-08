@@ -69,7 +69,7 @@ jobs:
 
       # amd64 is native; arm64 and armv7 are emulated. Kept on one runner
       # type so this works on public and private repos alike.
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
         if: matrix.arch != 'amd64'
         with:
           platforms: ${{ matrix.platform }}
