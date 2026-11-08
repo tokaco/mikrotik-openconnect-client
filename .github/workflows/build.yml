@@ -21,7 +21,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: shellcheck
         run: |
@@ -61,7 +61,7 @@ jobs:
           - { arch: arm64, platform: linux/arm64,  runner: ubuntu-latest }
           - { arch: armv7, platform: linux/arm/v7, runner: ubuntu-latest }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Lowercase image name
         id: img
