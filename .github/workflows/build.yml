@@ -1,0 +1,195 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly rebuild so base-image CVE fixes land without a commit.
+    - cron: '27 4 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --shell=sh --severity=warning entrypoint.sh vpnc-script tests/test-urlparse.sh
+
+      # The parser must behave identically on dash (Debian) and busybox ash
+      # (Alpine), so it is exercised under both rather than under bash.
+      - name: URL parser tests under dash
+        run: |
+          sudo apt-get install -y -qq dash
+          dash tests/test-urlparse.sh ./entrypoint.sh
+
+      - name: URL parser tests under busybox ash
+        run: docker run --rm -v "$PWD:/w:ro" -w /w busybox:stable sh tests/test-urlparse.sh ./entrypoint.sh
+
+  # Per-architecture build. Each job pushes one single-arch tag; the merge job
+  # below stitches them into a multi-arch manifest. Done this way (rather than
+  # one buildx run with three platforms) so that BOTH tag styles exist:
+  # a multi-arch tag, and explicit per-arch tags as a fallback for RouterOS
+  # builds that mishandle manifest lists.
+  build:
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [alpine, debian]
+        arch: [amd64, arm64, armv7]
+        # `include` here only attaches platform/runner to the existing
+        # variant x arch combinations; it does not add new ones.
+        include:
+          - { arch: amd64, platform: linux/amd64,  runner: ubuntu-latest }
+          - { arch: arm64, platform: linux/arm64,  runner: ubuntu-latest }
+          - { arch: armv7, platform: linux/arm/v7, runner: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Lowercase image name
+        id: img
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # amd64 is native; arm64 and armv7 are emulated. Kept on one runner
+      # type so this works on public and private repos alike.
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.arch != 'amd64'
+        with:
+          platforms: ${{ matrix.platform }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.variant == 'alpine' && 'Dockerfile' || 'Dockerfile.debian' }}
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.img.outputs.name }}:${{ matrix.variant }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ matrix.arch }}
+
+      # Smoke-test the image we just built, on the one arch we can execute
+      # here. --parse and --doctor run without a VPN server or NET_ADMIN.
+      - name: Smoke test
+        if: matrix.arch == 'amd64'
+        run: |
+          docker build -q --load --platform ${{ matrix.platform }} \
+            -f ${{ matrix.variant == 'alpine' && 'Dockerfile' || 'Dockerfile.debian' }} \
+            -t smoke:${{ matrix.variant }} .
+          got=$(docker run --rm smoke:${{ matrix.variant }} \
+                  --parse 'https://connect.example/?route=abc' | awk '$1=="url"{print $3}')
+          [ "$got" = 'https://connect.example/?route=abc' ] \
+            || { echo "unexpected parse result: $got"; exit 1; }
+          docker run --rm smoke:${{ matrix.variant }} --doctor >/dev/null
+          echo "parse + doctor OK"
+          # Data-plane test: real tun device, real routes, real NAT rules.
+          docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
+            -v "$PWD/tests:/tests:ro" --entrypoint /bin/sh \
+            smoke:${{ matrix.variant }} /tests/test-vpnc-script.sh
+          # The URL parser must also pass inside the image, under its own shell.
+          docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint /bin/sh \
+            smoke:${{ matrix.variant }} /tests/test-urlparse.sh /entrypoint.sh
+          # Certificate-auth configuration, checked through --print-cmd
+          # without touching the network. The PKI is generated by a helper
+          # image because the Alpine image has no openssl CLI.
+          mkdir -p "$RUNNER_TEMP/certs"
+          docker run --rm -v "$PWD/tests:/tests:ro" -v "$RUNNER_TEMP/certs:/out" \
+            --entrypoint /bin/sh debian:trixie-slim -c \
+            'apt-get update -qq >/dev/null && apt-get install -y -qq openssl >/dev/null && sh /tests/gen-test-certs.sh /out'
+          docker run --rm -v "$PWD/tests:/tests:ro" -v "$RUNNER_TEMP/certs:/certs:ro" \
+            --entrypoint /bin/sh smoke:${{ matrix.variant }} \
+            /tests/test-certauth.sh /entrypoint.sh /certs
+
+      # Full tunnel against a real ocserv configured for certificate-only
+      # auth: proves certificate authentication end to end, not just that the
+      # flags are spelled right.
+      - name: End-to-end certificate auth
+        if: matrix.arch == 'amd64'
+        run: sh tests/test-e2e-certauth.sh smoke:${{ matrix.variant }}
+
+  # Combine the per-arch tags into multi-arch manifests, so a MikroTik can
+  # just reference :latest and get the right architecture automatically.
+  merge:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [alpine, debian]
+    steps:
+      - name: Lowercase image name
+        id: img
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Alpine is the default, so it owns :latest and the bare version tags.
+      # Debian is the fallback and is always prefixed.
+      - name: Compute tags
+        id: tags
+        run: |
+          IMG='${{ steps.img.outputs.name }}'
+          V='${{ matrix.variant }}'
+          ref='${{ github.ref }}'
+          tags="$IMG:$V"
+          if [ "$V" = alpine ]; then tags="$tags $IMG:latest"; fi
+          case "$ref" in
+            refs/tags/v*)
+              ver=${ref#refs/tags/v}
+              if [ "$V" = alpine ]; then
+                tags="$tags $IMG:$ver"
+              else
+                tags="$tags $IMG:$ver-debian"
+              fi
+              ;;
+          esac
+          echo "list=$tags" >> "$GITHUB_OUTPUT"
+          echo "will tag: $tags"
+
+      - name: Create multi-arch manifests
+        run: |
+          IMG='${{ steps.img.outputs.name }}'
+          V='${{ matrix.variant }}'
+          args=""
+          for t in ${{ steps.tags.outputs.list }}; do args="$args --tag $t"; done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $args \
+            "$IMG:$V-amd64" "$IMG:$V-arm64" "$IMG:$V-armv7"
+
+      - name: Show result
+        run: docker buildx imagetools inspect '${{ steps.img.outputs.name }}:${{ matrix.variant }}'

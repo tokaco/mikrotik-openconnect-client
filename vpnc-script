@@ -1,0 +1,238 @@
+#!/bin/sh
+# vpnc-script for openconnect inside a MikroTik container.
+# Configures the TUN device, installs routes pushed by the VPN server, pins a
+# host route to the VPN gateway via the original default route, and sets up
+# SNAT so traffic forwarded from MikroTik gets a valid source IP.
+#
+# POSIX sh only: must run under both busybox ash (Alpine) and dash (Debian).
+# $IPTABLES and $IPTABLES_NAT_TARGET are exported by entrypoint.sh, which has
+# already probed which netfilter backend this RouterOS kernel actually
+# supports. Fall back to plain "iptables" when run standalone.
+
+set -u
+
+IPTABLES="${IPTABLES:-iptables}"
+IPTABLES_NAT_TARGET="${IPTABLES_NAT_TARGET:-MASQUERADE}"
+MTU="${INTERNAL_IP4_MTU:-${ANYCONNECT_MTU:-1412}}"
+STATE_DIR="/tmp/vpnc-state"
+mkdir -p "$STATE_DIR"
+
+log() { echo "vpnc-script: $*"; }
+
+# Pushed routes come from the VPN server, so sanity-check them before they
+# reach `ip route`. An address is digits/dots (v4) or hex/colons (v6).
+valid_prefix() {
+    case "$1" in
+        ""|*[!0-9a-fA-F.:]*) return 1 ;;
+    esac
+    case "$2" in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+    [ "$2" -ge 0 ] && [ "$2" -le 128 ]
+}
+
+setup_snat() {
+    dev="$1"; addr="$2"
+    case "$IPTABLES_NAT_TARGET" in
+        MASQUERADE)
+            if $IPTABLES -t nat -A POSTROUTING -o "$dev" -j MASQUERADE 2>&1; then
+                log "MASQUERADE added on $dev via $IPTABLES"
+            else
+                log "MASQUERADE FAILED on $dev; trying SNAT --to-source $addr"
+                $IPTABLES -t nat -A POSTROUTING -o "$dev" -j SNAT --to-source "$addr" \
+                    && log "SNAT added on $dev" \
+                    || log "SNAT setup FAILED -- forwarded traffic will be dropped by the VPN"
+            fi
+            ;;
+        SNAT)
+            # Kernel has iptable_nat but no MASQUERADE target module.
+            $IPTABLES -t nat -A POSTROUTING -o "$dev" -j SNAT --to-source "$addr" \
+                && log "SNAT --to-source $addr added on $dev" \
+                || log "SNAT setup FAILED -- forwarded traffic will be dropped by the VPN"
+            ;;
+        *)
+            log "no usable NAT target on this kernel; skipping SNAT."
+            log "  Traffic forwarded from MikroTik will reach the VPN with a"
+            log "  private source IP and almost certainly be dropped."
+            ;;
+    esac
+}
+
+teardown_snat() {
+    dev="$1"; addr="$2"
+    $IPTABLES -t nat -D POSTROUTING -o "$dev" -j MASQUERADE 2>/dev/null || true
+    $IPTABLES -t nat -D POSTROUTING -o "$dev" -j SNAT --to-source "$addr" 2>/dev/null || true
+}
+
+pin_vpn_gateway() {
+    # Закрепляем маршрут до VPN-сервера через исходный default, чтобы SSL-сокет
+    # openconnect не попал в туннель после установки default via tun0.
+    orig_default=$(ip route show default | grep -v "dev $TUNDEV" | head -1)
+    if [ -z "$orig_default" ]; then
+        log "no pre-existing default route to pin the VPN gateway through"
+        return
+    fi
+    orig_gw=$(echo "$orig_default"  | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
+    orig_dev=$(echo "$orig_default" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+    echo "$orig_gw"  > "$STATE_DIR/orig_gw"
+    echo "$orig_dev" > "$STATE_DIR/orig_dev"
+
+    if [ -n "$orig_gw" ] && [ -n "$orig_dev" ]; then
+        ip route replace "$VPNGATEWAY/32" via "$orig_gw" dev "$orig_dev"
+        log "pinned $VPNGATEWAY via $orig_gw dev $orig_dev"
+    fi
+}
+
+unpin_vpn_gateway() {
+    ip route del "$VPNGATEWAY/32" 2>/dev/null || true
+}
+
+install_pushed_routes() {
+    # Сервер пушит split-routes -> ставим каждую подсеть через tun0.
+    # Split отсутствует -> default через tun0 (full tunnel).
+    if [ "${CISCO_SPLIT_INC:-0}" -gt 0 ]; then
+        i=0
+        while [ "$i" -lt "$CISCO_SPLIT_INC" ]; do
+            eval "addr=\${CISCO_SPLIT_INC_${i}_ADDR:-}"
+            eval "mlen=\${CISCO_SPLIT_INC_${i}_MASKLEN:-}"
+            if valid_prefix "$addr" "$mlen"; then
+                ip route replace "$addr/$mlen" dev "$TUNDEV"
+                log "route $addr/$mlen dev $TUNDEV"
+            elif [ -n "$addr$mlen" ]; then
+                log "ignoring malformed pushed route '$addr/$mlen'"
+            fi
+            i=$((i + 1))
+        done
+    else
+        # Полный туннель. Удаляем старый default (через veth-tun) и ставим через tun0.
+        ip route del default 2>/dev/null || true
+        ip route replace default dev "$TUNDEV"
+        log "default route -> $TUNDEV (full tunnel)"
+    fi
+
+    # Split-excludes must go through the original uplink, not the tunnel.
+    # Ignoring these (as the previous version did) silently black-holed every
+    # prefix the server asked us to keep off the VPN.
+    if [ "${CISCO_SPLIT_EXC:-0}" -gt 0 ] \
+       && [ -f "$STATE_DIR/orig_gw" ] && [ -f "$STATE_DIR/orig_dev" ]; then
+        exc_gw=$(cat "$STATE_DIR/orig_gw")
+        exc_dev=$(cat "$STATE_DIR/orig_dev")
+        i=0
+        while [ "$i" -lt "$CISCO_SPLIT_EXC" ]; do
+            eval "addr=\${CISCO_SPLIT_EXC_${i}_ADDR:-}"
+            eval "mlen=\${CISCO_SPLIT_EXC_${i}_MASKLEN:-}"
+            if valid_prefix "$addr" "$mlen" && [ -n "$exc_gw" ] && [ -n "$exc_dev" ]; then
+                ip route replace "$addr/$mlen" via "$exc_gw" dev "$exc_dev" \
+                    && log "exclude $addr/$mlen via $exc_gw dev $exc_dev" \
+                    || log "could not install exclude route $addr/$mlen"
+            fi
+            i=$((i + 1))
+        done
+    fi
+}
+
+remove_pushed_routes() {
+    if [ "${CISCO_SPLIT_INC:-0}" -gt 0 ]; then
+        i=0
+        while [ "$i" -lt "$CISCO_SPLIT_INC" ]; do
+            eval "addr=\${CISCO_SPLIT_INC_${i}_ADDR:-}"
+            eval "mlen=\${CISCO_SPLIT_INC_${i}_MASKLEN:-}"
+            if valid_prefix "$addr" "$mlen"; then
+                ip route del "$addr/$mlen" dev "$TUNDEV" 2>/dev/null || true
+            fi
+            i=$((i + 1))
+        done
+    else
+        ip route del default dev "$TUNDEV" 2>/dev/null || true
+        # Восстановим оригинальный default, если сохранили его.
+        if [ -f "$STATE_DIR/orig_gw" ] && [ -f "$STATE_DIR/orig_dev" ]; then
+            ip route replace default via "$(cat "$STATE_DIR/orig_gw")" \
+                dev "$(cat "$STATE_DIR/orig_dev")" 2>/dev/null || true
+        fi
+    fi
+
+    if [ "${CISCO_SPLIT_EXC:-0}" -gt 0 ]; then
+        i=0
+        while [ "$i" -lt "$CISCO_SPLIT_EXC" ]; do
+            eval "addr=\${CISCO_SPLIT_EXC_${i}_ADDR:-}"
+            eval "mlen=\${CISCO_SPLIT_EXC_${i}_MASKLEN:-}"
+            if valid_prefix "$addr" "$mlen"; then
+                ip route del "$addr/$mlen" 2>/dev/null || true
+            fi
+            i=$((i + 1))
+        done
+    fi
+}
+
+# DNS pushed by the VPN is OPT-IN (ANYCONNECT_VPN_DNS=1) and off by default.
+# Rationale: the container's resolv.conf is only used to resolve the VPN
+# server itself. Pointing it at a nameserver that lives *inside* the tunnel
+# means that once the tunnel drops, the server hostname can no longer be
+# resolved -- and the reconnect loop in entrypoint.sh can never recover.
+# MikroTik's own DNS serves the LAN, so the tunnel's DNS is usually not wanted.
+setup_vpn_dns() {
+    [ "${ANYCONNECT_VPN_DNS:-0}" = "1" ] || return 0
+    [ -n "${INTERNAL_IP4_DNS:-}" ] || { log "VPN pushed no DNS servers"; return 0; }
+    cp /etc/resolv.conf "$STATE_DIR/resolv.conf.orig" 2>/dev/null || true
+    {
+        [ -n "${CISCO_DEF_DOMAIN:-}" ] && echo "search $CISCO_DEF_DOMAIN"
+        for ns in $INTERNAL_IP4_DNS; do echo "nameserver $ns"; done
+    } > /etc/resolv.conf 2>/dev/null \
+        && log "resolv.conf -> VPN DNS ($INTERNAL_IP4_DNS)" \
+        || log "could not write /etc/resolv.conf (read-only?)"
+}
+
+restore_dns() {
+    [ "${ANYCONNECT_VPN_DNS:-0}" = "1" ] || return 0
+    if [ -f "$STATE_DIR/resolv.conf.orig" ]; then
+        cp "$STATE_DIR/resolv.conf.orig" /etc/resolv.conf 2>/dev/null \
+            && log "resolv.conf restored" || true
+    fi
+}
+
+case "${reason:-}" in
+  pre-init)
+    :
+    ;;
+
+  connect)
+    log "connect, dev=$TUNDEV ip=$INTERNAL_IP4_ADDRESS mtu=$MTU vpn_gw=${VPNGATEWAY:-?}"
+
+    ip link set dev "$TUNDEV" up mtu "$MTU"
+
+    if [ -n "${INTERNAL_IP4_NETMASKLEN:-}" ]; then
+        ip addr replace "$INTERNAL_IP4_ADDRESS/$INTERNAL_IP4_NETMASKLEN" dev "$TUNDEV"
+    else
+        ip addr replace "$INTERNAL_IP4_ADDRESS/32" peer "$INTERNAL_IP4_ADDRESS" dev "$TUNDEV"
+    fi
+
+    pin_vpn_gateway
+    install_pushed_routes
+    setup_snat "$TUNDEV" "$INTERNAL_IP4_ADDRESS"
+    setup_vpn_dns
+
+    log "--- routes after connect ---"
+    ip route
+    log "--- nat POSTROUTING ---"
+    $IPTABLES -t nat -L POSTROUTING -v -n || true
+    ;;
+
+  disconnect)
+    log "disconnect, dev=$TUNDEV"
+    restore_dns
+    teardown_snat "$TUNDEV" "${INTERNAL_IP4_ADDRESS:-0.0.0.0}"
+    remove_pushed_routes
+    unpin_vpn_gateway
+    ip link set dev "$TUNDEV" down 2>/dev/null || true
+    ;;
+
+  reconnect)
+    log "reconnect"
+    ;;
+
+  *)
+    log "unknown reason '${reason:-}'"
+    ;;
+esac
+
+exit 0

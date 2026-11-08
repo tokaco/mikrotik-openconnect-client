@@ -1,0 +1,10 @@
+# Test-only AnyConnect-compatible server (ocserv) configured for client
+# certificate authentication. Used by tests/test-e2e-certauth.sh; never
+# published, and its certificates are generated fresh per run.
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ocserv iproute2 iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+COPY ocserv.conf /etc/ocserv/ocserv.conf
+EXPOSE 443
+CMD ["ocserv", "-f", "-c", "/etc/ocserv/ocserv.conf", "-d", "1"]
